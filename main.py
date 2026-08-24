@@ -281,11 +281,14 @@ def parse_svelte_json(json_data, symbol, exchange, report_type, period):
     return final_rows
 
 # =========================
-# 5. TARGET PROCESSOR
+# 5. TARGET PROCESSOR (With BOM Slug Mapping)
 # =========================
 async def process_target(target, tasks_config, session, semaphore, tracker, is_retry=False):
     symbol = target["symbol"]
-    exchange = target["exchange"].lower()
+    exchange = target["exchange"].upper()
+    
+    # StockAnalysis routes BSE pages under 'bom'
+    exchange_slug = "bom" if exchange == "BSE" else exchange.lower()
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -303,7 +306,7 @@ async def process_target(target, tasks_config, session, semaphore, tracker, is_r
             statement_cfg = STATEMENT_REGISTRY[report_type]
             suffix = statement_cfg["url_suffix"].strip("/")
 
-            url_path = f"/quote/{exchange}/{symbol.lower()}/financials"
+            url_path = f"/quote/{exchange_slug}/{symbol.lower()}/financials"
             if suffix:
                 url_path += f"/{suffix}"
 
@@ -315,6 +318,7 @@ async def process_target(target, tasks_config, session, semaphore, tracker, is_r
                 async with session.get(url, headers=headers, timeout=20) as response:
                     if response.status == 200:
                         json_data = await response.json()
+                        # Pass clean exchange name ('BSE' / 'NSE') to keep Parquet partitioned cleanly
                         rows = parse_svelte_json(json_data, symbol, exchange, report_type, period)
                         all_rows.extend(rows)
                     elif response.status in [403, 429]:
@@ -327,11 +331,11 @@ async def process_target(target, tasks_config, session, semaphore, tracker, is_r
     tag = f"[{tracker.increment()}/{tracker.total}]" if not is_retry else "[RETRY]"
 
     if all_rows:
-        logging.info(f"{tag} [{exchange.upper()}] {symbol} → {len(all_rows)} metrics extracted")
+        logging.info(f"{tag} [{exchange}] {symbol} → {len(all_rows)} metrics extracted")
     elif failed_config:
-        logging.warning(f"{tag} [{exchange.upper()}] {symbol} → {len(failed_config)} requests blocked/queued")
+        logging.warning(f"{tag} [{exchange}] {symbol} → {len(failed_config)} requests blocked/queued")
     else:
-        logging.info(f"{tag} [{exchange.upper()}] {symbol} → 0 rows (No data)")
+        logging.info(f"{tag} [{exchange}] {symbol} → 0 rows (No data)")
 
     return target, all_rows, failed_config
 
