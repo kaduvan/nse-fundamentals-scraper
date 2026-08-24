@@ -30,18 +30,21 @@ class ProgressTracker:
         return self.current
 
 # =========================
-# 2. DYNAMIC TICKER MATCHER
+# 2. MULTI-EXCHANGE DYNAMIC TICKER MATCHER
 # =========================
-async def fetch_nse_tickers(session):
-    urls = [
-        "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
-        "https://nsearchives.nseindia.com/content/sme/SME_EQUITY_L.csv"
-    ]
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/csv"}
-    logging.info("Fetching dynamic ticker list from NSE (Mainboard & SME)...")
+async def fetch_all_tickers(session):
+    """Fetches live active equities for NSE, NSE-SME, and BSE."""
+    targets = []
     
-    symbols = set() 
-    for url in urls:
+    # 1. Fetch NSE & SME
+    nse_urls = [
+        ("https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv", "NSE"),
+        ("https://nsearchives.nseindia.com/content/sme/SME_EQUITY_L.csv", "NSE")
+    ]
+    
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/csv"}
+    
+    for url, exch in nse_urls:
         try:
             async with session.get(url, headers=headers, timeout=15) as response:
                 if response.status == 200:
@@ -50,19 +53,38 @@ async def fetch_nse_tickers(session):
                     next(reader) 
                     for row in reader:
                         if row and row[0].strip():
-                            symbols.add(row[0].strip())
+                            targets.append({"symbol": row[0].strip(), "exchange": exch})
         except Exception as e:
-            logging.error(f"Error fetching dynamic tickers from {url}: {e}")
-            
-    if symbols:
-        logging.info(f"✅ Successfully loaded {len(symbols)} active NSE tickers.")
-        return list(symbols)
-    return ["RELIANCE", "TCS", "HDFCBANK", "SUZLON"]
+            logging.error(f"Error fetching NSE tickers from {url}: {e}")
+
+    # 2. Fetch BSE Tickers
+    bse_url = "https://www.bseindia.com/downloads/BSE_StockList.csv"
+    try:
+        async with session.get(bse_url, headers=headers, timeout=15) as response:
+            if response.status == 200:
+                text = await response.text()
+                reader = csv.reader(io.StringIO(text))
+                next(reader) 
+                for row in reader:
+                    if row and row[0].strip():
+                        targets.append({"symbol": row[0].strip(), "exchange": "BSE"})
+    except Exception as e:
+        logging.error(f"Error fetching BSE tickers: {e}")
+
+    if targets:
+        logging.info(f"✅ Successfully loaded {len(targets)} total cross-exchange tickers (NSE, SME, BSE).")
+        return targets
+        
+    # Fallback if exchanges are down
+    return [
+        {"symbol": "RELIANCE", "exchange": "NSE"},
+        {"symbol": "500510", "exchange": "BSE"}
+    ]
 
 # =========================
 # 3. SVELTEKIT JSON PARSER
 # =========================
-def parse_svelte_json(json_data, symbol, report_type, period):
+def parse_svelte_json(json_data, symbol, exchange, report_type, period):
     nodes = json_data.get("nodes", [])
     root, flat_data = None, []
     
@@ -112,16 +134,19 @@ def parse_svelte_json(json_data, symbol, report_type, period):
                             "metric": str(metric_title),
                             "period_date": str(date),
                             "value": str(val),
-                            "exchange": "NSE",
+                            "exchange": exchange.upper(),
                             "statement_type": report_type.replace("_", " ").title(),
                             "period": period.title()
                         })
     return final_rows
 
 # =========================
-# 4. SYMBOL PROCESSOR
+# 4. TARGET PROCESSOR
 # =========================
-async def process_symbol(symbol, targets, session, semaphore, tracker, is_retry=False):
+async def process_target(target, tasks_config, session, semaphore, tracker, is_retry=False):
+    symbol = target["symbol"]
+    exchange = target["exchange"].lower()
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
@@ -130,80 +155,81 @@ async def process_symbol(symbol, targets, session, semaphore, tracker, is_retry=
         "Sec-Fetch-Site": "same-origin"
     }
     
-    all_symbol_rows = []
-    failed_targets = []
+    all_rows = []
+    failed_config = []
 
     async with semaphore:
-        for period, report_type in targets:
+        for period, report_type in tasks_config:
             statement_cfg = STATEMENT_REGISTRY[report_type]
             suffix = statement_cfg["url_suffix"].strip("/")
             
-            url_path = f"/quote/nse/{symbol.lower()}/financials"
+            url_path = f"/quote/{exchange}/{symbol.lower()}/financials"
             if suffix: url_path += f"/{suffix}"
                 
             url = f"https://stockanalysis.com{url_path}/__data.json?x-sveltekit-trailing-slash=1&x-sveltekit-invalidated=011"
             if period == "quarterly": url += "&p=quarterly"
 
             try:
-                # Running naked on GitHub Azure IPs (No proxy needed for now)
                 async with session.get(url, headers=headers, timeout=20) as response:
                     if response.status == 200:
                         json_data = await response.json()
-                        rows = parse_svelte_json(json_data, symbol, report_type, period)
-                        all_symbol_rows.extend(rows)
+                        rows = parse_svelte_json(json_data, symbol, exchange, report_type, period)
+                        all_rows.extend(rows)
                     elif response.status in [403, 429]:
-                        failed_targets.append((period, report_type))
-                        if not is_retry: logging.warning(f"🚨 [{symbol}] {period} {report_type} blocked.")
+                        failed_config.append((period, report_type))
             except Exception:
-                failed_targets.append((period, report_type))
+                failed_config.append((period, report_type))
 
             await asyncio.sleep(0.5)
 
     if not is_retry:
         count = tracker.increment()
-        if all_symbol_rows:
-            logging.info(f"[{count}/{tracker.total}] {symbol} → {len(all_symbol_rows)} metrics extracted")
-        elif not failed_targets:
-            logging.info(f"[{count}/{tracker.total}] {symbol} → 0 rows (Company has no data)")
+        if all_rows:
+            logging.info(f"[{count}/{tracker.total}] [{exchange.upper()}] {symbol} → {len(all_rows)} metrics extracted")
+        elif not failed_config:
+            logging.info(f"[{count}/{tracker.total}] [{exchange.upper()}] {symbol} → 0 rows")
 
-    return symbol, all_symbol_rows, failed_targets
+    return target, all_rows, failed_config
 
 # =========================
-# 5. MAIN ORCHESTRATOR
+# 5. MAIN ORCHESTRATOR & R2 MERGE
 # =========================
 async def main():
     semaphore = asyncio.Semaphore(CONCURRENCY)
     master_data = []
 
     async with aiohttp.ClientSession() as session:
-        symbols = await fetch_nse_tickers(session)
-        tracker = ProgressTracker(len(symbols))
+        targets = await fetch_all_tickers(session)
+        tracker = ProgressTracker(len(targets))
         
-        base_targets = [(p, r) for p in ["annual", "quarterly"] for r in STATEMENT_REGISTRY.keys()]
+        base_tasks = [(p, r) for p in ["annual", "quarterly"] for r in STATEMENT_REGISTRY.keys()]
 
-        logging.info(f"Starting Main Scrape Pass for {len(symbols)} symbols...")
-        tasks = [process_symbol(symbol, base_targets, session, semaphore, tracker) for symbol in symbols]
+        logging.info(f"Starting Main Scrape Pass across {len(targets)} targets...")
+        tasks = [process_target(t, base_tasks, session, semaphore, tracker) for t in targets]
         results = await asyncio.gather(*tasks)
 
         failed_queue = {}
-        for sym, rows, fails in results:
+        for target, rows, fails in results:
             master_data.extend(rows)
-            if fails: failed_queue[sym] = fails
+            if fails: 
+                # Use symbol + exchange tuple as dictionary key
+                key = (target["symbol"], target["exchange"])
+                failed_queue[key] = fails
         
         if failed_queue:
-            logging.warning(f"⚠️ {len(failed_queue)} symbols had partial blocks. Waiting 10 seconds before Retry Pass...")
+            logging.warning(f"⚠️ {len(failed_queue)} targets had partial blocks. Retrying...")
             await asyncio.sleep(10)
-            retry_tasks = [process_symbol(sym, fails, session, semaphore, tracker, is_retry=True) for sym, fails in failed_queue.items()]
+            
+            retry_tasks = [
+                process_target({"symbol": sym, "exchange": exch}, fails, session, semaphore, tracker, is_retry=True)
+                for (sym, exch), fails in failed_queue.items()
+            ]
             retry_results = await asyncio.gather(*retry_tasks)
             
-            for sym, rows, fails in retry_results:
+            for target, rows, fails in retry_results:
                 master_data.extend(rows)
-            
-            final_fails = sum(1 for sym, rows, fails in retry_results if fails)
-            if final_fails > 0: logging.warning(f"❌ {final_fails} symbols still failed after retry. Skipping.")
-            else: logging.info("✅ All retries successful!")
 
-    logging.info("✅ API Sweep finished. Initiating R2 Sync...")
+    logging.info("✅ Scraping complete. Initiating Cloudflare R2 Sync...")
     
     if master_data:
         try:
@@ -232,8 +258,9 @@ async def main():
                 );
             """)
 
-            logging.info(f"Merging {len(master_data)} fresh rows into R2 Parquet...")
+            logging.info(f"Merging {len(master_data)} total rows into R2 Parquet...")
             
+            # DuckDB upsert handles deduplication across ticker, metric, period, date, AND exchange
             upsert_query = f"""
                 CREATE OR REPLACE TEMP TABLE updated_master AS
                 WITH safe_new_data AS (
@@ -264,7 +291,7 @@ async def main():
             """
             con.sql(upsert_query)
             con.sql(f"COPY updated_master TO '{master_file}' (FORMAT PARQUET, COMPRESSION 'ZSTD');")
-            logging.info("✅ Data lake successfully updated!")
+            logging.info("✅ Cloudflare R2 Data Lake successfully updated!")
             
         except Exception as e:
             logging.error(f"❌ R2 Sync Failed: {str(e)}")
