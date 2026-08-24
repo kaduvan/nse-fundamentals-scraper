@@ -37,7 +37,6 @@ async def fetch_all_tickers(session):
     targets = []
     seen_isins = set()
 
-    # 1. Fetch NSE Mainboard & NSE-SME (Primary Source)
     nse_urls = [
         ("https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv", "NSE"),
         ("https://nsearchives.nseindia.com/content/sme/SME_EQUITY_L.csv", "NSE")
@@ -69,9 +68,6 @@ async def fetch_all_tickers(session):
         except Exception as e:
             logging.error(f"Error fetching {exch} tickers from {url}: {e}")
 
-    logging.info(f"Loaded {len(targets)} NSE/SME tickers ({len(seen_isins)} unique ISINs).")
-
-    # 2. Fetch BSE and Filter for BSE-Exclusive Scrips Only
     bse_urls = [
         "https://api.bseindia.com/BseIndiaAPI/api/LitsOfScripCSVDownload/w?Group=&Scripcode=&segment=Equity&status=Active",
         "https://api.bseindia.com/BseIndiaAPI/api/LitsOfScripCSVDownload/w?Group=&Scripcode=&segment=EQT0&status=Active"
@@ -81,8 +77,6 @@ async def fetch_all_tickers(session):
         "Referer": "https://www.bseindia.com/",
         "Accept": "text/csv"
     }
-
-    bse_added, bse_skipped = 0, 0
 
     for url in bse_urls:
         try:
@@ -103,23 +97,17 @@ async def fetch_all_tickers(session):
                             scrip_code = row[code_idx].strip()
                             bse_isin = row[isin_idx].strip() if isin_idx != -1 and len(row) > isin_idx else ""
 
-                            if bse_isin and bse_isin in seen_isins:
-                                bse_skipped += 1
-                                continue
-
+                            if bse_isin and bse_isin in seen_isins: continue
                             if scrip_code:
                                 targets.append({"symbol": scrip_code, "exchange": "BSE", "isin": bse_isin})
-                                if bse_isin:
-                                    seen_isins.add(bse_isin)
-                                bse_added += 1
+                                if bse_isin: seen_isins.add(bse_isin)
         except Exception as e:
             logging.error(f"Error fetching BSE tickers from {url}: {e}")
 
-    logging.info(f"⚡ Smart Deduplication: Added {bse_added} BSE-exclusive tickers; skipped {bse_skipped} dual-listed duplicates.")
     return targets
 
 # =========================
-# 3. R2 COVERAGE PRE-CHECK (Smart Delta Planner)
+# 3. R2 METADATA COOLDOWN & CHECKER
 # =========================
 def get_expected_filing_cutoffs():
     today = date.today()
@@ -140,18 +128,20 @@ def get_existing_r2_coverage():
     r2_account = os.getenv("R2_ACCOUNT_ID")
     r2_bucket = os.getenv("R2_BUCKET_NAME", "financial-data-lake")
 
-    if not all([r2_access, r2_secret, r2_account]):
-        logging.warning("R2 environment variables not fully set. Proceeding without pre-check.")
-        return {}
+    if not all([r2_access, r2_secret, r2_account]): return {}
 
     master_file = f"r2://{r2_bucket}/fundamentals_master.parquet"
     con = duckdb.connect()
     con.sql(f"CREATE SECRET (TYPE r2, KEY_ID '{r2_access}', SECRET '{r2_secret}', ACCOUNT_ID '{r2_account}');")
 
     try:
-        logging.info("Checking existing coverage in Cloudflare R2...")
+        logging.info("Scanning R2 for latest reporting dates and scraping cooldowns...")
+        # Extracts both the max financial date AND the metadata marker for last scraped date
         query = f"""
-            SELECT ticker, exchange, period, MAX(period_date) as max_date
+            SELECT 
+                ticker, exchange, period, 
+                MAX(CASE WHEN metric != 'LAST_SCRAPED' THEN period_date END) as max_date,
+                MAX(CASE WHEN metric = 'LAST_SCRAPED' THEN value END) as last_scraped
             FROM '{master_file}'
             WHERE period_date != 'TTM' AND period_date IS NOT NULL
             GROUP BY ticker, exchange, period
@@ -162,18 +152,51 @@ def get_existing_r2_coverage():
         for _, row in df.iterrows():
             key = (str(row["ticker"]).upper(), str(row["exchange"]).upper())
             if key not in coverage: coverage[key] = {}
-            coverage[key][str(row["period"]).lower()] = str(row["max_date"])
+            p = str(row["period"]).lower()
+            
+            m_date = row["max_date"]
+            l_scrape = row["last_scraped"]
+            coverage[key][p] = {
+                "max_date": str(m_date) if pd.notna(m_date) else None,
+                "last_scraped": str(l_scrape) if pd.notna(l_scrape) else None
+            }
         return coverage
     except Exception as e:
-        logging.warning(f"Could not inspect R2 master file (initial load): {e}")
+        logging.warning("No previous R2 coverage found (initial load).")
         return {}
 
 def plan_targets_for_stock(symbol, exchange, coverage_map, expected_annual, expected_quarterly):
     key = (symbol.upper(), exchange.upper())
     stock_cov = coverage_map.get(key, {})
 
-    need_annual = not (stock_cov.get("annual") and stock_cov.get("annual") >= expected_annual)
-    need_quarterly = not (stock_cov.get("quarterly") and stock_cov.get("quarterly") >= expected_quarterly)
+    # Annual Check
+    ann_data = stock_cov.get("annual", {})
+    max_ann = ann_data.get("max_date")
+    last_scraped_ann = ann_data.get("last_scraped")
+
+    need_annual = True
+    if max_ann and max_ann >= expected_annual:
+        need_annual = False
+    elif last_scraped_ann:
+        try:
+            # 15-Day Cooldown: If StockAnalysis didn't have it yesterday, don't spam it today
+            if (date.today() - date.fromisoformat(last_scraped_ann)).days < 15:
+                need_annual = False
+        except: pass
+
+    # Quarterly Check
+    qtr_data = stock_cov.get("quarterly", {})
+    max_qtr = qtr_data.get("max_date")
+    last_scraped_qtr = qtr_data.get("last_scraped")
+
+    need_quarterly = True
+    if max_qtr and max_qtr >= expected_quarterly:
+        need_quarterly = False
+    elif last_scraped_qtr:
+        try:
+            if (date.today() - date.fromisoformat(last_scraped_qtr)).days < 15:
+                need_quarterly = False
+        except: pass
 
     planned_tasks = []
     if need_annual:
@@ -245,24 +268,17 @@ async def process_target(target, tasks_config, session, semaphore, tracker, is_r
     exchange = target["exchange"].upper()
     isin = target.get("isin", "")
     
-    # Map 'BSE' to 'bom' for StockAnalysis routing
     exchange_slug = "bom" if exchange == "BSE" else exchange.lower()
-
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
     }
 
     all_rows, failed_config = [], []
 
     async with semaphore:
         for period, report_type in tasks_config:
-            statement_cfg = STATEMENT_REGISTRY[report_type]
-            suffix = statement_cfg["url_suffix"].strip("/")
-
+            suffix = STATEMENT_REGISTRY[report_type]["url_suffix"].strip("/")
             url_path = f"/quote/{exchange_slug}/{symbol.lower()}/financials"
             if suffix: url_path += f"/{suffix}"
             url = f"https://stockanalysis.com{url_path}/__data.json?x-sveltekit-trailing-slash=1&x-sveltekit-invalidated=011"
@@ -278,17 +294,35 @@ async def process_target(target, tasks_config, session, semaphore, tracker, is_r
                         failed_config.append((period, report_type))
             except Exception:
                 failed_config.append((period, report_type))
-
             await asyncio.sleep(0.4)
 
-    tag = f"[{tracker.increment()}/{tracker.total}]" if not is_retry else "[RETRY]"
+    # --- INJECT METADATA MARKER ---
+    # This dummy row tells DuckDB exactly when we scraped this ticker
+    current_date = str(date.today())
+    periods_checked = set(p for p, r in tasks_config)
+    for p in periods_checked:
+        all_rows.append({
+            "ticker": str(symbol).upper(),
+            "isin": str(isin).upper(),
+            "metric": "LAST_SCRAPED",
+            "period_date": "9999-12-31",
+            "value": current_date, # Saves today's date
+            "exchange": exchange.upper(),
+            "statement_type": "Metadata",
+            "period": p.title()
+        })
 
-    if all_rows:
-        logging.info(f"{tag} [{exchange}] {symbol} → {len(all_rows)} metrics extracted")
+    tag = f"[{tracker.increment()}/{tracker.total}]" if not is_retry else "[RETRY]"
+    
+    # Do not count the metadata markers as actual financial metrics in the console log
+    real_metric_count = len([r for r in all_rows if r["metric"] != "LAST_SCRAPED"])
+
+    if real_metric_count > 0:
+        logging.info(f"{tag} [{exchange}] {symbol} → {real_metric_count} metrics extracted")
     elif failed_config:
         logging.warning(f"{tag} [{exchange}] {symbol} → {len(failed_config)} requests blocked/queued")
     else:
-        logging.info(f"{tag} [{exchange}] {symbol} → 0 rows (No data)")
+        logging.info(f"{tag} [{exchange}] {symbol} → 0 rows (No data on StockAnalysis)")
 
     return target, all_rows, failed_config
 
@@ -308,9 +342,7 @@ async def main():
         skipped_count = 0
 
         for target in all_targets:
-            planned = plan_targets_for_stock(
-                target["symbol"], target["exchange"], coverage_map, expected_annual, expected_quarterly
-            )
+            planned = plan_targets_for_stock(target["symbol"], target["exchange"], coverage_map, expected_annual, expected_quarterly)
             if planned: scrape_queue.append((target, planned))
             else: skipped_count += 1
 
@@ -329,13 +361,9 @@ async def main():
             logging.warning(f"⚠️ {len(failed_queue)} targets had blocks. Waiting 10s before Retry Pass...")
             await asyncio.sleep(10)
 
-            retry_tasks = [
-                process_target(target, fails, session, semaphore, tracker, is_retry=True)
-                for _, (target, fails) in failed_queue.items()
-            ]
+            retry_tasks = [process_target(target, fails, session, semaphore, tracker, is_retry=True) for _, (target, fails) in failed_queue.items()]
             retry_results = await asyncio.gather(*retry_tasks)
-            for _, rows, _ in retry_results:
-                master_data.extend(rows)
+            for _, rows, _ in retry_results: master_data.extend(rows)
 
     logging.info("Scraping finished. Starting Cloudflare R2 merge...")
 
@@ -347,43 +375,33 @@ async def main():
             r2_account = os.getenv("R2_ACCOUNT_ID")
             r2_bucket = os.getenv("R2_BUCKET_NAME", "financial-data-lake")
 
-            if not all([r2_access, r2_secret, r2_account]):
-                logging.error("Missing R2 Environment Variables! Skipping upload.")
-                return
-
             master_file = f"r2://{r2_bucket}/fundamentals_master.parquet"
             con = duckdb.connect()
             con.execute("PRAGMA memory_limit='4GB';")
             con.register("raw_new_data", df)
-
             con.sql(f"CREATE SECRET (TYPE r2, KEY_ID '{r2_access}', SECRET '{r2_secret}', ACCOUNT_ID '{r2_account}');")
 
             logging.info(f"Merging {len(master_data)} rows into R2 Parquet...")
 
+            # Note the updated ORDER BY clause to ensure DuckDB keeps the freshest LAST_SCRAPED marker
             upsert_query = f"""
                 CREATE OR REPLACE TEMP TABLE updated_master AS
                 WITH safe_new_data AS (
                     SELECT 
-                        CAST(ticker AS VARCHAR) AS ticker,
-                        CAST(isin AS VARCHAR) AS isin,
-                        CAST(metric AS VARCHAR) AS metric,
-                        CAST(period_date AS VARCHAR) AS period_date,
-                        CAST(value AS VARCHAR) AS value,
-                        CAST(exchange AS VARCHAR) AS exchange,
-                        CAST(statement_type AS VARCHAR) AS statement_type,
-                        CAST(period AS VARCHAR) AS period
+                        CAST(ticker AS VARCHAR) AS ticker, CAST(isin AS VARCHAR) AS isin,
+                        CAST(metric AS VARCHAR) AS metric, CAST(period_date AS VARCHAR) AS period_date,
+                        CAST(value AS VARCHAR) AS value, CAST(exchange AS VARCHAR) AS exchange,
+                        CAST(statement_type AS VARCHAR) AS statement_type, CAST(period AS VARCHAR) AS period
                     FROM raw_new_data
                 ),
                 combined_data AS (
-                    SELECT * FROM '{master_file}'
-                    UNION ALL BY NAME
-                    SELECT * FROM safe_new_data
+                    SELECT * FROM '{master_file}' UNION ALL BY NAME SELECT * FROM safe_new_data
                 ),
                 deduplicated AS (
                     SELECT *,
                         ROW_NUMBER() OVER (
                             PARTITION BY ticker, metric, period_date, period, exchange 
-                            ORDER BY period_date DESC
+                            ORDER BY CASE WHEN metric = 'LAST_SCRAPED' THEN value ELSE period_date END DESC
                         ) as rn
                     FROM combined_data
                 )
@@ -395,8 +413,6 @@ async def main():
 
         except Exception as e:
             logging.error(f"❌ R2 Sync Failed: {str(e)}")
-    else:
-        logging.info("ℹ️ No new metrics needed to be written. All records up to date.")
 
 if __name__ == "__main__":
     asyncio.run(main())
