@@ -3,22 +3,23 @@ import io
 import os
 import csv
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 import duckdb
 import pandas as pd
 import aiohttp
 
 # =========================
-# 1. CONFIGURATION & LOGGING
+# 1. CONFIGURATION & REGISTRY
 # =========================
 CONCURRENCY = 10
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Exact canonical 4-statement catalog
 STATEMENT_REGISTRY = {
-    "income": {"url_suffix": "/"},
-    "balance_sheet": {"url_suffix": "/balance-sheet/"},
-    "cash_flow": {"url_suffix": "/cash-flow-statement/"},
-    "ratios": {"url_suffix": "/ratios/"}
+    "Income": {"url_suffix": "/"},
+    "Balance Sheet": {"url_suffix": "/balance-sheet/"},
+    "Cash Flow": {"url_suffix": "/cash-flow-statement/"},
+    "Ratios": {"url_suffix": "/ratios/"}
 }
 
 class ProgressTracker:
@@ -31,7 +32,7 @@ class ProgressTracker:
         return self.current
 
 # =========================
-# 2. DYNAMIC TICKER MATCHER (With ISIN Deduplication)
+# 2. DYNAMIC TICKER MATCHER (ISIN DEDUPED)
 # =========================
 async def fetch_all_tickers(session):
     targets = []
@@ -66,7 +67,7 @@ async def fetch_all_tickers(session):
                                 if isin:
                                     seen_isins.add(isin)
         except Exception as e:
-            logging.error(f"Error fetching {exch} tickers from {url}: {e}")
+            logging.error(f"Error fetching {exch} tickers: {e}")
 
     bse_urls = [
         "https://api.bseindia.com/BseIndiaAPI/api/LitsOfScripCSVDownload/w?Group=&Scripcode=&segment=Equity&status=Active",
@@ -97,17 +98,19 @@ async def fetch_all_tickers(session):
                             scrip_code = row[code_idx].strip()
                             bse_isin = row[isin_idx].strip() if isin_idx != -1 and len(row) > isin_idx else ""
 
-                            if bse_isin and bse_isin in seen_isins: continue
+                            if bse_isin and bse_isin in seen_isins: 
+                                continue
                             if scrip_code:
                                 targets.append({"symbol": scrip_code, "exchange": "BSE", "isin": bse_isin})
-                                if bse_isin: seen_isins.add(bse_isin)
+                                if bse_isin: 
+                                    seen_isins.add(bse_isin)
         except Exception as e:
-            logging.error(f"Error fetching BSE tickers from {url}: {e}")
+            logging.error(f"Error fetching BSE tickers: {e}")
 
     return targets
 
 # =========================
-# 3. R2 METADATA COOLDOWN & CHECKER
+# 3. R2 COVERAGE & COOLDOWN CHECKER
 # =========================
 def get_expected_filing_cutoffs():
     today = date.today()
@@ -128,15 +131,14 @@ def get_existing_r2_coverage():
     r2_account = os.getenv("R2_ACCOUNT_ID")
     r2_bucket = os.getenv("R2_BUCKET_NAME", "financial-data-lake")
 
-    if not all([r2_access, r2_secret, r2_account]): return {}
+    if not all([r2_access, r2_secret, r2_account]): 
+        return {}
 
     master_file = f"r2://{r2_bucket}/fundamentals_master.parquet"
     con = duckdb.connect()
     con.sql(f"CREATE SECRET (TYPE r2, KEY_ID '{r2_access}', SECRET '{r2_secret}', ACCOUNT_ID '{r2_account}');")
 
     try:
-        logging.info("Scanning R2 for latest reporting dates and scraping cooldowns...")
-        # Extracts both the max financial date AND the metadata marker for last scraped date
         query = f"""
             SELECT 
                 ticker, exchange, period, 
@@ -154,15 +156,13 @@ def get_existing_r2_coverage():
             if key not in coverage: coverage[key] = {}
             p = str(row["period"]).lower()
             
-            m_date = row["max_date"]
-            l_scrape = row["last_scraped"]
             coverage[key][p] = {
-                "max_date": str(m_date) if pd.notna(m_date) else None,
-                "last_scraped": str(l_scrape) if pd.notna(l_scrape) else None
+                "max_date": str(row["max_date"]) if pd.notna(row["max_date"]) else None,
+                "last_scraped": str(row["last_scraped"]) if pd.notna(row["last_scraped"]) else None
             }
         return coverage
     except Exception as e:
-        logging.warning("No previous R2 coverage found (initial load).")
+        logging.warning(f"Could not read R2 master file (initial load or empty): {e}")
         return {}
 
 def plan_targets_for_stock(symbol, exchange, coverage_map, expected_annual, expected_quarterly):
@@ -179,10 +179,10 @@ def plan_targets_for_stock(symbol, exchange, coverage_map, expected_annual, expe
         need_annual = False
     elif last_scraped_ann:
         try:
-            # 15-Day Cooldown: If StockAnalysis didn't have it yesterday, don't spam it today
             if (date.today() - date.fromisoformat(last_scraped_ann)).days < 15:
                 need_annual = False
-        except: pass
+        except Exception:
+            pass
 
     # Quarterly Check
     qtr_data = stock_cov.get("quarterly", {})
@@ -196,50 +196,65 @@ def plan_targets_for_stock(symbol, exchange, coverage_map, expected_annual, expe
         try:
             if (date.today() - date.fromisoformat(last_scraped_qtr)).days < 15:
                 need_quarterly = False
-        except: pass
+        except Exception:
+            pass
 
     planned_tasks = []
     if need_annual:
-        planned_tasks.extend([("annual", r) for r in STATEMENT_REGISTRY.keys()])
+        planned_tasks.extend([("annual", stmt_type) for stmt_type in STATEMENT_REGISTRY.keys()])
     if need_quarterly:
-        planned_tasks.extend([("quarterly", r) for r in STATEMENT_REGISTRY.keys()])
+        planned_tasks.extend([("quarterly", stmt_type) for stmt_type in STATEMENT_REGISTRY.keys()])
 
     return planned_tasks
 
 # =========================
-# 4. SVELTEKIT JSON PARSER
+# 4. SVELTEKIT JSON PARSER WITH FILED_DATE & CANONICAL METRICS
 # =========================
-def parse_svelte_json(json_data, symbol, exchange, isin, report_type, period):
+def parse_svelte_json(json_data, symbol, exchange, isin, canonical_statement, period):
     nodes = json_data.get("nodes", [])
     root, flat_data = None, []
 
     for node in nodes:
-        if not isinstance(node, dict) or "data" not in node: continue
+        if not isinstance(node, dict) or "data" not in node: 
+            continue
         current_flat_data = node["data"]
         for item in current_flat_data:
             if isinstance(item, dict) and "financialData" in item and "map" in item:
                 root = item
                 flat_data = current_flat_data
                 break
-        if root: break
+        if root: 
+            break
 
-    if not root or not flat_data: return []
+    if not root or not flat_data: 
+        return []
 
     def resolve(val):
         return flat_data[val] if (isinstance(val, int) and 0 <= val < len(flat_data)) else val
 
     financial_data = resolve(root["financialData"])
     metric_map_refs = resolve(root["map"])
+    
     date_refs = resolve(financial_data.get("datekey", []))
     dates = [resolve(idx) for idx in date_refs]
 
+    # Look for upstream filing/announcement dates if provided by the vendor
+    filing_date_refs = resolve(financial_data.get("filingDate", financial_data.get("date", [])))
+    filing_dates = [resolve(idx) for idx in filing_date_refs] if isinstance(filing_date_refs, list) else []
+
+    current_timestamp = datetime.now(timezone.utc).isoformat()
     final_rows = []
+
     for ref in metric_map_refs:
         metric_obj = resolve(ref)
-        if not isinstance(metric_obj, dict): continue
+        if not isinstance(metric_obj, dict): 
+            continue
 
         metric_id = resolve(metric_obj.get("id"))
         metric_title = resolve(metric_obj.get("title"))
+
+        # Prioritize Title Case display label; fallback to formatted camelCase key
+        canonical_metric_name = str(metric_title).strip() if metric_title else str(metric_id).strip()
 
         if metric_id in financial_data:
             values_ref = resolve(financial_data[metric_id])
@@ -248,15 +263,20 @@ def parse_svelte_json(json_data, symbol, exchange, isin, report_type, period):
                 for i, date_val in enumerate(dates):
                     if i < len(values):
                         val = values[i] if values[i] is not None else ""
+                        
+                        f_date = str(filing_dates[i]) if (i < len(filing_dates) and filing_dates[i]) else None
+
                         final_rows.append({
                             "ticker": str(symbol).upper(),
                             "isin": str(isin).upper(),
-                            "metric": str(metric_title),
-                            "period_date": str(date_val),
-                            "value": str(val),
                             "exchange": exchange.upper(),
-                            "statement_type": report_type.replace("_", " ").title(),
-                            "period": period.title()
+                            "statement_type": canonical_statement,
+                            "period": period.title(),
+                            "period_date": str(date_val),
+                            "filed_date": f_date,
+                            "metric": canonical_metric_name,
+                            "value": str(val),
+                            "updated_at": current_timestamp
                         })
     return final_rows
 
@@ -277,57 +297,60 @@ async def process_target(target, tasks_config, session, semaphore, tracker, is_r
     all_rows, failed_config = [], []
 
     async with semaphore:
-        for period, report_type in tasks_config:
-            suffix = STATEMENT_REGISTRY[report_type]["url_suffix"].strip("/")
+        for period, statement_type in tasks_config:
+            suffix = STATEMENT_REGISTRY[statement_type]["url_suffix"].strip("/")
             url_path = f"/quote/{exchange_slug}/{symbol.lower()}/financials"
-            if suffix: url_path += f"/{suffix}"
+            if suffix: 
+                url_path += f"/{suffix}"
             url = f"https://stockanalysis.com{url_path}/__data.json?x-sveltekit-trailing-slash=1&x-sveltekit-invalidated=011"
-            if period == "quarterly": url += "&p=quarterly"
+            if period == "quarterly": 
+                url += "&p=quarterly"
 
             try:
                 async with session.get(url, headers=headers, timeout=20) as response:
                     if response.status == 200:
                         json_data = await response.json()
-                        rows = parse_svelte_json(json_data, symbol, exchange, isin, report_type, period)
+                        rows = parse_svelte_json(json_data, symbol, exchange, isin, statement_type, period)
                         all_rows.extend(rows)
                     elif response.status in [403, 429]:
-                        failed_config.append((period, report_type))
+                        failed_config.append((period, statement_type))
             except Exception:
-                failed_config.append((period, report_type))
+                failed_config.append((period, statement_type))
+
             await asyncio.sleep(0.4)
 
-    # --- INJECT METADATA MARKER ---
-    # This dummy row tells DuckDB exactly when we scraped this ticker
+    # Inject 15-day metadata cooldown marker
     current_date = str(date.today())
-    periods_checked = set(p for p, r in tasks_config)
+    current_timestamp = datetime.now(timezone.utc).isoformat()
+    periods_checked = set(p for p, _ in tasks_config)
     for p in periods_checked:
         all_rows.append({
             "ticker": str(symbol).upper(),
             "isin": str(isin).upper(),
-            "metric": "LAST_SCRAPED",
-            "period_date": "9999-12-31",
-            "value": current_date, # Saves today's date
             "exchange": exchange.upper(),
             "statement_type": "Metadata",
-            "period": p.title()
+            "period": p.title(),
+            "period_date": "9999-12-31",
+            "filed_date": None,
+            "metric": "LAST_SCRAPED",
+            "value": current_date,
+            "updated_at": current_timestamp
         })
 
     tag = f"[{tracker.increment()}/{tracker.total}]" if not is_retry else "[RETRY]"
-    
-    # Do not count the metadata markers as actual financial metrics in the console log
     real_metric_count = len([r for r in all_rows if r["metric"] != "LAST_SCRAPED"])
 
     if real_metric_count > 0:
-        logging.info(f"{tag} [{exchange}] {symbol} → {real_metric_count} metrics extracted")
+        logging.info(f"{tag} [{exchange}] {symbol} → {real_metric_count} canonical metrics extracted")
     elif failed_config:
-        logging.warning(f"{tag} [{exchange}] {symbol} → {len(failed_config)} requests blocked/queued")
+        logging.warning(f"{tag} [{exchange}] {symbol} → {len(failed_config)} requests queued for retry")
     else:
-        logging.info(f"{tag} [{exchange}] {symbol} → 0 rows (No data on StockAnalysis)")
+        logging.info(f"{tag} [{exchange}] {symbol} → 0 rows (No data on source)")
 
     return target, all_rows, failed_config
 
 # =========================
-# 6. MAIN ORCHESTRATOR & SYNC
+# 6. ORCHESTRATOR & PARQUET UPSERT
 # =========================
 async def main():
     semaphore = asyncio.Semaphore(CONCURRENCY)
@@ -342,11 +365,15 @@ async def main():
         skipped_count = 0
 
         for target in all_targets:
-            planned = plan_targets_for_stock(target["symbol"], target["exchange"], coverage_map, expected_annual, expected_quarterly)
-            if planned: scrape_queue.append((target, planned))
-            else: skipped_count += 1
+            planned = plan_targets_for_stock(
+                target["symbol"], target["exchange"], coverage_map, expected_annual, expected_quarterly
+            )
+            if planned: 
+                scrape_queue.append((target, planned))
+            else: 
+                skipped_count += 1
 
-        logging.info(f"⚡ Smart Delta: {skipped_count} tickers up to date. Scraping {len(scrape_queue)} targets.")
+        logging.info(f"⚡ Smart Delta: {skipped_count} tickers up to date. Scraping {len(scrape_queue)} active queues.")
 
         tracker = ProgressTracker(len(scrape_queue))
         tasks = [process_target(target, task_cfg, session, semaphore, tracker) for target, task_cfg in scrape_queue]
@@ -355,17 +382,22 @@ async def main():
         failed_queue = {}
         for target, rows, fails in results:
             master_data.extend(rows)
-            if fails: failed_queue[(target["symbol"], target["exchange"])] = (target, fails)
+            if fails: 
+                failed_queue[(target["symbol"], target["exchange"])] = (target, fails)
 
         if failed_queue:
-            logging.warning(f"⚠️ {len(failed_queue)} targets had blocks. Waiting 10s before Retry Pass...")
+            logging.warning(f"⚠️ {len(failed_queue)} targets had blocks. Retrying after 10s...")
             await asyncio.sleep(10)
 
-            retry_tasks = [process_target(target, fails, session, semaphore, tracker, is_retry=True) for _, (target, fails) in failed_queue.items()]
+            retry_tasks = [
+                process_target(target, fails, session, semaphore, tracker, is_retry=True)
+                for _, (target, fails) in failed_queue.items()
+            ]
             retry_results = await asyncio.gather(*retry_tasks)
-            for _, rows, _ in retry_results: master_data.extend(rows)
+            for _, rows, _ in retry_results: 
+                master_data.extend(rows)
 
-    logging.info("Scraping finished. Starting Cloudflare R2 merge...")
+    logging.info("Scraping finished. Merging into Cloudflare R2...")
 
     if master_data:
         try:
@@ -375,44 +407,61 @@ async def main():
             r2_account = os.getenv("R2_ACCOUNT_ID")
             r2_bucket = os.getenv("R2_BUCKET_NAME", "financial-data-lake")
 
+            if not all([r2_access, r2_secret, r2_account]):
+                logging.error("Missing R2 credentials. Aborting sync.")
+                return
+
             master_file = f"r2://{r2_bucket}/fundamentals_master.parquet"
             con = duckdb.connect()
             con.execute("PRAGMA memory_limit='4GB';")
             con.register("raw_new_data", df)
             con.sql(f"CREATE SECRET (TYPE r2, KEY_ID '{r2_access}', SECRET '{r2_secret}', ACCOUNT_ID '{r2_account}');")
 
-            logging.info(f"Merging {len(master_data)} rows into R2 Parquet...")
+            logging.info(f"Merging {len(master_data)} rows into R2 Parquet with strict primary key deduplication...")
 
-            # Note the updated ORDER BY clause to ensure DuckDB keeps the freshest LAST_SCRAPED marker
             upsert_query = f"""
                 CREATE OR REPLACE TEMP TABLE updated_master AS
                 WITH safe_new_data AS (
                     SELECT 
-                        CAST(ticker AS VARCHAR) AS ticker, CAST(isin AS VARCHAR) AS isin,
-                        CAST(metric AS VARCHAR) AS metric, CAST(period_date AS VARCHAR) AS period_date,
-                        CAST(value AS VARCHAR) AS value, CAST(exchange AS VARCHAR) AS exchange,
-                        CAST(statement_type AS VARCHAR) AS statement_type, CAST(period AS VARCHAR) AS period
+                        CAST(ticker AS VARCHAR) AS ticker,
+                        CAST(isin AS VARCHAR) AS isin,
+                        CAST(exchange AS VARCHAR) AS exchange,
+                        CAST(statement_type AS VARCHAR) AS statement_type,
+                        CAST(period AS VARCHAR) AS period,
+                        CAST(period_date AS VARCHAR) AS period_date,
+                        CAST(filed_date AS VARCHAR) AS filed_date,
+                        CAST(metric AS VARCHAR) AS metric,
+                        CAST(value AS VARCHAR) AS value,
+                        CAST(updated_at AS VARCHAR) AS updated_at
                     FROM raw_new_data
                 ),
                 combined_data AS (
-                    SELECT * FROM '{master_file}' UNION ALL BY NAME SELECT * FROM safe_new_data
+                    SELECT * FROM '{master_file}' 
+                    UNION ALL BY NAME 
+                    SELECT * FROM safe_new_data
                 ),
                 deduplicated AS (
                     SELECT *,
                         ROW_NUMBER() OVER (
-                            PARTITION BY ticker, metric, period_date, period, exchange 
-                            ORDER BY CASE WHEN metric = 'LAST_SCRAPED' THEN value ELSE period_date END DESC
+                            PARTITION BY ticker, exchange, statement_type, period, period_date, metric 
+                            ORDER BY 
+                                CASE WHEN metric = 'LAST_SCRAPED' THEN value ELSE updated_at END DESC,
+                                period_date DESC
                         ) as rn
                     FROM combined_data
                 )
-                SELECT * EXCLUDE (rn) FROM deduplicated WHERE rn = 1;
+                SELECT * EXCLUDE (rn) 
+                FROM deduplicated 
+                WHERE rn = 1;
             """
             con.sql(upsert_query)
             con.sql(f"COPY updated_master TO '{master_file}' (FORMAT PARQUET, COMPRESSION 'ZSTD');")
-            logging.info("✅ Cloudflare R2 Data Lake successfully updated!")
+            logging.info("✅ Cloudflare R2 Data Lake updated and fully reconciled!")
 
         except Exception as e:
             logging.error(f"❌ R2 Sync Failed: {str(e)}")
+    else:
+        logging.info("No new data to merge. Data lake is current.")
 
 if __name__ == "__main__":
     asyncio.run(main())
